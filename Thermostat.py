@@ -1,68 +1,68 @@
-# Smart thermostat, built for M5Stack Core2.
+# Smart thermostat, built for LILYGO T-Display S3.
 #
 # Key features:
-# - all thermostat logic is built into this Python script and runs on Core2
+# - all thermostat logic is built into this Python script and runs on T-Display S3
 # - thermostat supports auto, manual, fan, heat, cool modes
 # - minimum cycle duration can be set (THERMO_MIN_CYCLE)
 # - swing mode is enabled and can be customized (THERMO_COLD_TOLERANCE and THERMO_HEAT_TOLERANCE)
 #
 # Configuration considerations:
 # - Relies on separate config.py file to store secrets (WiFI and MQTT connection details)
-# - Gets actual temperature through ENVII sensor, connected to the Core2. But you could easily set up another
-#   external temperature sensor and communicate values to the Core2 through MQTT
-# - Uses MQTT to communicate with relays that turn on/off furnace, fan, and AC. You need to configure the right
-#   topics and payloads to establish that communication (variables starting with RELAY_)
-# - Graphics files for heat/cool/fan need to be stored in the /res directory (from materialdesignicons.com, 24x24 px, R:66, G:165, B:245)
+# - Gets actual temperature through DHT22 sensor, connected to the T-Display S3.
+# - Uses MQTT to communicate with relays that turn on/off furnace, fan, and AC.
+# - Graphics files for heat/cool/fan need to be stored in the /res directory
 #
 # Home Assistant integration:
 # - Integrates with Home Assistant through MQTT (you need MQTT enabled on the HA side)
 # - Supports MQTT auto-discovery. No configuration needed on the HA side.
-# - Will create 'Core2 Thermostat' device with following entities:
-#    - 3 sensors for temperature, humidity, and pressure (if using the ENVII)
+# - Will create 'T-Display S3 Thermostat' device with following entities:
+#    - 1 sensor for temperature (if using the DHT22)
 #    - 1 thermostat entity
 #    - 2 switch entities for manually turning on/off heater/ac (fan is not implemented yet)
-# - The thermostat entity allows you to control target temperature and thermostat mode through HA. Any changes will be reflected on the Core2.
+# - The thermostat entity allows you to control target temperature and thermostat mode through HA. Any changes will be reflected on the T-Display S3.
 # - When you manually switch a device on/off through the HA interface, the thermostat entity will be switched to 'off'
-#   while the Core2 will automatically switch to manual mode (HA doesn't support a 'manual mode' for the thermostat)
+#   while the T-Display S3 will automatically switch to manual mode (HA doesn't support a 'manual mode' for the thermostat)
 # - The switch entities in HA are subscribed to the same MQTT topics you've configured to communicate with your appliances. However, when HA issues
-#   a switch change, the command will go only to the Core2, who will process it, switch the termostat to manual mode, and then executes a state change.
+#   a switch change, the command will go only to the T-Display S3, who will process it, switch the termostat to manual mode, and then executes a state change.
 #
 # Usage notes:
 # - Upon start the thermostat will be OFF. Tapping the OFF label will run the thermostat through the various modes: OFF - AUTO - MAN - HEAT - COOL - FAN
 # - When in manual mode, use the A/B/C buttons to turn on/off heat pump, AC, Fan. Only 1 device can be on at a given time.
-# - When min cycle duration requirement isn't met, the Core2 display will blink until it is able to implement the change
+# - When min cycle duration requirement isn't met, the T-Display S3 display will blink until it is able to implement the change
 # - Blinking is not supported on the Lovelace thermostat card. The HA dashboard will not change until the min cycle duration requirement is met.
-# - Core2 can display temperature in Celsius or Fahrenheit (set DISP_TEMPERATURE accordingly). Default is Fahrenheit.
+# - T-Display S3 can display temperature in Celsius or Fahrenheit (set DISP_TEMPERATURE accordingly). Default is Fahrenheit.
 #   Home Assistant will display temperature depending on your HA preferences (metric vs imperial) 
 
-from m5stack import *
-from m5stack_ui import *
-from uiflow import *
-import wifiCfg
-from m5mqtt import M5mqtt
-import unit
+from machine import Pin, SPI
+import tft_config
+import vga1_bold_16x32 as font
+import dht
+import network
+from umqtt.simple import MQTTClient
 import math
 from numbers import Number
-import lvgl as lv
 import json
 import config
 
 # Device information
-ATTR_MANUFACTURER = "M5Stack"
-ATTR_MODEL = "Core 2"
-ATTR_NAME = "Core 2 Thermostat"
+ATTR_MANUFACTURER = "LILYGO"
+ATTR_MODEL = "T-Display S3"
+ATTR_NAME = "T-Display S3 Thermostat"
+
+# Pin definitions
+DHT_PIN = 15  # Adjust this to match your DHT22 connection
 
 # Default topics used to communicate with Home Assistant
 DEFAULT_DISC_PREFIX = "homeassistant/"
-DEFAULT_TOPIC_THERMOSTAT_PREFIX = "core2/thermostat/"
-DEFAULT_TOPIC_SENSOR_PREFIX = "core2/env2/"
-DEFAULT_TOPIC_DEBUG = "core2/debug/"
-DEFAULT_TOPIC_SWITCH_PREFIX = "core2/switch/"
+DEFAULT_TOPIC_THERMOSTAT_PREFIX = "t-display-s3/thermostat/"
+DEFAULT_TOPIC_SENSOR_PREFIX = "t-display-s3/dht22/"
+DEFAULT_TOPIC_DEBUG = "t-display-s3/debug/"
+DEFAULT_TOPIC_SWITCH_PREFIX = "t-display-s3/switch/"
 
 # Topics to send/receive commands to other sensors directly
 MASTER_SWITCH_TOPIC = "test-master-switch/switch/master_switch/state"
 
-# Details on how the information on the Core2 display should be rendered
+# Details on how the information on the T-Display S3 display should be rendered
 DISP_R1 = 90
 DISP_R2 = 70
 DISP_XCOORD = 160
@@ -116,9 +116,9 @@ KEY_PAYLOAD_ON = "pl_on"
 KEY_UNIT_OF_MEASUREMENT = "unit_of_meas"
 
 # Topic and Payload details used to communicate with the furnace, AC, and fan(s)
-RELAY_HEAT_TOPIC = "core2/heat"
-RELAY_COOL_TOPIC = "core2/cool"
-RELAY_FAN_TOPIC = "core2/fan"
+RELAY_HEAT_TOPIC = "t-display-s3/heat"
+RELAY_COOL_TOPIC = "t-display-s3/cool"
+RELAY_FAN_TOPIC = "t-display-s3/fan"
 RELAY_HEAT_PAYLOAD_ON = "ON"
 RELAY_HEAT_PAYLOAD_OFF = "OFF"
 RELAY_COOL_PAYLOAD_ON = "ON"
@@ -160,9 +160,10 @@ THERMO_HEAT_TOLERANCE = 0.5      # C
 THERMO_UPDATE_FREQUENCY = 20   # seconds
 THERMO_MODES = ["off", "auto", "man", "heat", "cool", "fan"]
 
-screen = M5Screen()
-screen.clean_screen()
-screen.set_screen_bg_color(0x000000)
+# Initialize display
+tft = tft_config.tft
+tft.init(tft_config.MHS35, width=240, height=240, speed=40000000, rst_pin=33, backl_pin=32, miso=19, mosi=23, clk=18, cs=14, dc=27, bgr=True, backl_on=1, invrot=3)
+tft.set_brightness(10)
 
 # Using lvgl library to implement an invisible touch area (behind the mode label) to switch thermostat mode
 lv.init()
@@ -212,24 +213,46 @@ btn.set_event_cb(change_mode)
 # load the screen
 lv.scr_load(scr)
 
-env20 = unit.get(unit.ENV2, unit.PORTA)
-img_BtnA = M5Img("res/heat.png", x=40, y=207, parent=None)
-img_BtnB = M5Img("res/cool.png", x=146, y=207, parent=None)
-img_BtnC = M5Img("res/fan.png", x=252, y=207, parent=None)
-slider_target = M5Slider(x=125, y=128, w=70, h=12, min=15, max=25, bg_c=0xa0a0a0, color=0x08A2B0, parent=None)
-slider_target.set_hidden(True)
-lbl_target = M5Label('', x=160, y=70, color=0x000, font=FONT_MONT_40, parent=None)
-lbl_action = M5Label('', x=160, y=60, color=0x000, font=FONT_MONT_12, parent=None)
-lbl_mode = M5Label('', x=160, y=168, color=0xffffff, font=FONT_MONT_12, parent=None)
+dht22 = dht.DHT22(Pin(DHT_PIN))
+
+img_BtnA = lv.img(scr)
+img_BtnA.set_src("res/heat.png")
+img_BtnA.align(None, lv.ALIGN.CENTER, 0, 55)
+
+img_BtnB = lv.img(scr)
+img_BtnB.set_src("res/cool.png")
+img_BtnB.align(None, lv.ALIGN.CENTER, 0, 55)
+
+img_BtnC = lv.img(scr)
+img_BtnC.set_src("res/fan.png")
+img_BtnC.align(None, lv.ALIGN.CENTER, 0, 55)
+
+slider_target = lv.slider(scr)
+slider_target.set_range(THERMO_MIN_TARGET, THERMO_MAX_TARGET)
+slider_target.set_value(20)
+slider_target.align(None, lv.ALIGN.CENTER, 0, 55)
+
+lbl_target = lv.label(scr)
+lbl_target.set_text("")
 lbl_target.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
+
+lbl_action = lv.label(scr)
+lbl_action.set_text("")
 lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_ACTION_OFFSET)
+
+lbl_mode = lv.label(scr)
+lbl_mode.set_text("")
 lbl_mode.set_align(ALIGN_CENTER, 0, DISP_LBL_MODE_OFFSET)
 
 # Setup initial comms and register with Home Assistant (through auto-discovery)
 def comms_init():
     global m5mqtt
-    wifiCfg.doConnect(WIFI_SSID, WIFI_PASS)
-    m5mqtt = M5mqtt(MQTT_ID, MQTT_IP, MQTT_PORT, MQTT_USER, MQTT_PASS, MQTT_KEEPALIVE)
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+    while not wlan.isconnected():
+        pass
+    m5mqtt = MQTTClient(MQTT_ID, MQTT_IP, MQTT_PORT, MQTT_USER, MQTT_PASS, MQTT_KEEPALIVE)
     
     # Subscribe to HA thermostat mode changes
     m5mqtt.subscribe(DEFAULT_TOPIC_THERMOSTAT_PREFIX + TOPIC_MODE_COMMAND, rcv_thermo_state)
@@ -254,10 +277,10 @@ def comms_init():
     mqtt_initialization()
 
 def mqtt_registration():
-    # Register ENVII Temperature sensor with Home Assistant
-    topic = "%ssensor/core2/core2-temp/config" % DEFAULT_DISC_PREFIX
+    # Register DHT22 Temperature sensor with Home Assistant
+    topic = "%ssensor/t-display-s3/t-display-s3-temp/config" % DEFAULT_DISC_PREFIX
     payload = {        
-        KEY_NAME: "Core2 Temperature",
+        KEY_NAME: "T-Display S3 Temperature",
         KEY_PAYLOAD_AVAILABLE: "on",
         KEY_PAYLOAD_NOT_AVAILABLE: "off",
         KEY_DEVICE_CLASS: "temperature",
@@ -276,54 +299,10 @@ def mqtt_registration():
     }
     m5mqtt.publish(topic, json.dumps(payload).encode('utf-8'))
 
-    # Register ENVII Pressure sensor with Home Assistant
-    topic = "%ssensor/core2/core2-pressure/config" % DEFAULT_DISC_PREFIX
-    payload = {        
-        KEY_NAME: "Core2 Pressure",
-        KEY_PAYLOAD_AVAILABLE: "on",
-        KEY_PAYLOAD_NOT_AVAILABLE: "off",
-        KEY_DEVICE_CLASS: "pressure",
-        KEY_UNIQUE_ID: "122346",
-        KEY_DEVICE: {
-            KEY_IDENTIFIERS: ["12234"],
-            KEY_NAME: ATTR_NAME,
-            KEY_MODEL: ATTR_MODEL,
-            KEY_MANUFACTURER: ATTR_MANUFACTURER
-        },
-        KEY_UNIT_OF_MEASUREMENT: "hPa",        
-        KEY_STATE_TOPIC: "~" + TOPIC_STATE,
-        "~": DEFAULT_TOPIC_SENSOR_PREFIX,
-        KEY_AVAILABILITY_TOPIC: "~" + TOPIC_STATUS,
-        KEY_VALUE_TEMPLATE: TPL_PRESSURE
-    }
-    m5mqtt.publish(topic, str(json.dumps(payload)))    
-
-    # Register ENVII Humidity sensor with Home Assistant
-    topic = "%ssensor/core2/core2-humid/config" % DEFAULT_DISC_PREFIX
-    payload = {        
-        KEY_NAME: "Core2 Humidity",
-        KEY_PAYLOAD_AVAILABLE: "on",
-        KEY_PAYLOAD_NOT_AVAILABLE: "off",
-        KEY_DEVICE_CLASS: "humidity",
-        KEY_UNIQUE_ID: "122347",
-        KEY_DEVICE: {
-            KEY_IDENTIFIERS: ["12234"],
-            KEY_NAME: ATTR_NAME,
-            KEY_MODEL: ATTR_MODEL,
-            KEY_MANUFACTURER: ATTR_MANUFACTURER
-        },
-        KEY_UNIT_OF_MEASUREMENT: "%", 
-        KEY_STATE_TOPIC: "~" + TOPIC_STATE,
-        "~": DEFAULT_TOPIC_SENSOR_PREFIX,
-        KEY_AVAILABILITY_TOPIC: "~" + TOPIC_STATUS,
-        KEY_VALUE_TEMPLATE: TPL_HUMIDITY
-    }
-    m5mqtt.publish(topic, str(json.dumps(payload)))
- 
-    # Register Core2 as HVAC device with Home Assistant
-    topic = "%sclimate/core2/config" % DEFAULT_DISC_PREFIX
+    # Register T-Display S3 as HVAC device with Home Assistant
+    topic = "%sclimate/t-display-s3/config" % DEFAULT_DISC_PREFIX
     payload = {
-        KEY_NAME: "Core2 Thermostat",
+        KEY_NAME: "T-Display S3 Thermostat",
         KEY_PAYLOAD_AVAILABLE: "on",
         KEY_PAYLOAD_NOT_AVAILABLE: "off",
         KEY_UNIQUE_ID: "122348",
@@ -352,9 +331,9 @@ def mqtt_registration():
     m5mqtt.publish(topic, str(json.dumps(payload)))
 
     # Register Heater for manual control with Home Assistant
-    topic = "%sswitch/core2/core2-heater/config" % DEFAULT_DISC_PREFIX
+    topic = "%sswitch/t-display-s3/t-display-s3-heater/config" % DEFAULT_DISC_PREFIX
     payload = {
-        KEY_NAME: "Core2 Heater",
+        KEY_NAME: "T-Display S3 Heater",
         KEY_PAYLOAD_AVAILABLE: "on",
         KEY_PAYLOAD_NOT_AVAILABLE: "off",
         KEY_UNIQUE_ID: "122349",
@@ -375,9 +354,9 @@ def mqtt_registration():
     m5mqtt.publish(topic, str(json.dumps(payload)))    
         
     # Register AC for manual control with Home Assistant
-    topic = "%sswitch/core2/core2-ac/config" % DEFAULT_DISC_PREFIX
+    topic = "%sswitch/t-display-s3/t-display-s3-ac/config" % DEFAULT_DISC_PREFIX
     payload = {
-        KEY_NAME: "Core2 AC",
+        KEY_NAME: "T-Display S3 AC",
         KEY_PAYLOAD_AVAILABLE: "on",
         KEY_PAYLOAD_NOT_AVAILABLE: "off",
         KEY_UNIQUE_ID: "122350",
@@ -413,12 +392,11 @@ def mqtt_initialization():
 def thermostat_init():
     global action, actual_temp, blink, change_ignored, cycle, delay, ticks, thermo_state, fan_state, cooling_state, heating_state, target_temp, manual_command
     action = 0
-    actual_temp = env20.temperature
+    actual_temp = dht22.temperature()
     blink = 0
     change_ignored = 0
     cycle = 0
     delay = 0      # initial delay of 10s so that user can select the right mode without appliances suddenly turning on
-    slider_target.set_range(THERMO_MIN_TARGET, THERMO_MAX_TARGET)
     slider_target.set_value(20)
     thermo_state = THERMO_MODES[0]
     target_temp = slider_target.get_value()
@@ -432,7 +410,7 @@ def thermostat_init():
 
 # update display everytime there is a change (due to incoming HA info, screen interaction, or sensor data changes)
 def update_display():
-    lcd.clear()
+    tft.clear()
     lbl_mode.set_text(thermo_state)
     lbl_mode.set_align(ALIGN_CENTER, 0, DISP_LBL_MODE_OFFSET)
     target_temp_display = round(target_temp if DISP_TEMPERATURE == "C" else target_temp * 9 / 5 + 32)
@@ -493,7 +471,7 @@ def update_display():
         
     # If mode is off
     if thermo_state == THERMO_MODES[0] and change_ignored == 0:
-        lcd.font(lcd.FONT_DejaVu40)
+        tft.font(font)
         lbl_action.set_text('')
         lbl_target.set_text("---")
         lbl_target.set_text_color(0xffffff)
@@ -563,23 +541,23 @@ def update_display():
     t = THERMO_MIN_TEMP
     while t <= THERMO_MAX_TEMP:
         angle = (t * 8 + 200) % 360
-        lcd.font(lcd.FONT_DejaVu18)
+        tft.font(font)
         if t > min(round(actual_temp),target_temp) and t < max(round(actual_temp), target_temp) and thermo_state in [THERMO_MODES[index] for index in [1,3,4]]:
-            lcd.line(
+            tft.line(
                 int(DISP_R1 * math.sin(angle / 180 * math.pi) + DISP_XCOORD),
                 int(DISP_YCOORD - DISP_R1 * math.cos(angle / 180 * math.pi)),
                 int(DISP_R2 * math.sin(angle / 180 * math.pi) + DISP_XCOORD),
                 int(DISP_YCOORD - DISP_R2 * math.cos(angle / 180 * math.pi)),
                 0xffffff)
         elif t == round(actual_temp):
-            lcd.line(
+            tft.line(
                 int(DISP_R1 * math.sin(angle / 180 * math.pi) + DISP_XCOORD),
                 int(DISP_YCOORD - DISP_R1 * math.cos(angle / 180 * math.pi)),
                 int((DISP_R2 - 10) * math.sin(angle / 180 * math.pi) + DISP_XCOORD),
                 int(DISP_YCOORD - (DISP_R2 - 10) * math.cos(angle / 180 * math.pi)),
                 0xffffff)
         else:
-            lcd.line(
+            tft.line(
                 int(DISP_R1 * math.sin(angle / 180 * math.pi) + DISP_XCOORD),
                 int(DISP_YCOORD - DISP_R1 * math.cos(angle / 180 * math.pi)),
                 int(DISP_R2 * math.sin(angle / 180 * math.pi) + DISP_XCOORD),
@@ -587,13 +565,13 @@ def update_display():
                 0x333333)
         t += 0.5    
     if round(actual_temp) >= target_temp or thermo_state in [THERMO_MODES[index] for index in [0,2,5]]:
-        lcd.print(
+        tft.print(
             round(actual_temp_display),
             int(DISP_R1 * math.sin(((actual_temp * 8 + 200) % 360 +4) / 180 * math.pi) + DISP_XCOORD),
             int(DISP_YCOORD - DISP_R1 * math.cos(((actual_temp * 8 +200) % 360 +4) / 180 * math.pi)),
             0xffffff)
     else:
-        lcd.print(
+        tft.print(
             round(actual_temp_display),
             int(DISP_R1 * math.sin(((actual_temp * 8 + 200) % 360 -20) / 180 * math.pi) + DISP_XCOORD),
             int(DISP_YCOORD - DISP_R1 * math.cos(((actual_temp * 8 +200) % 360 -20) / 180 * math.pi)),
@@ -606,7 +584,7 @@ def update_display():
 
 def thermostat_decision_logic():
     global actual_temp, target_temp, manual_command
-    actual_temp = env20.temperature
+    actual_temp = dht22.temperature()
     target_temp = slider_target.get_value()
     
     if thermo_state == THERMO_MODES[2]: 
@@ -728,11 +706,10 @@ def change_to (action):
 
 
 def update_mqtt_state_topics():
-    #update state of ENV sensors
+    #update state of DHT22 sensors
     payload = {
-        "temperature": env20.temperature,
-        "humidity": env20.humidity,
-        "pressure": env20.pressure
+        "temperature": dht22.temperature(),
+        "humidity": dht22.humidity()
         }
     m5mqtt.publish(DEFAULT_TOPIC_SENSOR_PREFIX + TOPIC_STATE,str(json.dumps(payload)))
     
@@ -849,4 +826,3 @@ while True:
         update_mqtt_state_topics()
         ticks = 0
     wait_ms(2)
-    

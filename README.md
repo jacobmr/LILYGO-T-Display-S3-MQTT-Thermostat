@@ -1,35 +1,81 @@
-# M5stack-Core2-MQTT-Thermostat
-## Smart thermostat, built for M5Stack Core2.
+# LILYGO T-Display S3 MQTT Thermostat
+## Smart thermostat, built for LILYGO T-Display S3 with DHT22 sensor
+
+This project is a fork of [M5stack-Core2-MQTT-Thermostat](https://github.com/user/M5stack-Core2-MQTT-Thermostat), modified to work with the LILYGO T-Display S3 and DHT22 temperature/humidity sensor.
 
 ## Key features:
- - all thermostat logic is built into this Python script and runs on Core2
- - thermostat supports auto, manual, fan, heat, cool modes
- - minimum cycle duration can be set (THERMO_MIN_CYCLE)
- - swing mode is enabled and can be customized (THERMO_COLD_TOLERANCE and THERMO_HEAT_TOLERANCE)
+ - All thermostat logic is built into this MicroPython script and runs on T-Display S3
+ - Thermostat supports auto, manual, fan, heat, cool modes
+ - Minimum cycle duration can be set (THERMO_MIN_CYCLE)
+ - Swing mode is enabled and can be customized (THERMO_COLD_TOLERANCE and THERMO_HEAT_TOLERANCE)
+ - Uses DHT22 sensor for accurate temperature and humidity readings
 
-## Configuration considerations:
- - Relies on separate config.py file to store secrets (WiFI and MQTT connection details)
- - Gets actual temperature through ENVII sensor, connected to the Core2. But you could easily set up another
-   external temperature sensor and communicate values to the Core2 through MQTT
- - Uses MQTT to communicate with relays that turn on/off furnace, fan, and AC. You need to configure the right
-   topics and payloads to establish that communication (variables starting with RELAY_)
- - Graphics files for heat/cool/fan need to be stored in the /res directory
+## Hardware Requirements:
+ - LILYGO T-Display S3
+ - DHT22 Temperature/Humidity Sensor
+ - Relays for controlling HVAC equipment
+
+## Wiring:
+ - DHT22 data pin connected to GPIO 15 (configurable in code)
+ - Display uses default T-Display S3 pins:
+   - SCK: GPIO 18
+   - MOSI: GPIO 23
+   - MISO: GPIO 19
+   - CS: GPIO 14
+   - DC: GPIO 27
+   - RST: GPIO 33
+   - BL: GPIO 32
+
+## Software Requirements:
+ - MicroPython for ESP32-S3
+ - Required libraries:
+   - st7789 (display driver)
+   - micropython-umqtt.simple
+   - dht (for DHT22 sensor)
+
+## Configuration:
+ - Create a `config.py` file to store secrets:
+   ```python
+   WIFI_SSID = "your_wifi_ssid"
+   WIFI_PASS = "your_wifi_password"
+   MQTT_IP = "your_mqtt_broker_ip"
+   MQTT_PORT = 1883
+   MQTT_USER = "your_mqtt_username"
+   MQTT_PASS = "your_mqtt_password"
+   ```
+ - Graphics files for heat/cool/fan need to be stored in the `/res` directory
+ - MQTT topics for relay control can be configured in the code (variables starting with RELAY_)
 
 ## Home Assistant integration:
- - Integrates with Home Assistant through MQTT (you need MQTT enabled on the HA side)
- - Supports MQTT auto-discovery. No configuration needed on the HA side.
- - Will create 'Core2 Thermostat' device with following entities:
-    - 3 sensors for temperature, humidity, and pressure (if using the ENVII)
+ - Integrates with Home Assistant through MQTT (MQTT integration required)
+ - Supports MQTT auto-discovery. No configuration needed on the HA side
+ - Creates 'T-Display S3 Thermostat' device with following entities:
+    - 2 sensors for temperature and humidity (from DHT22)
     - 1 thermostat entity
     - 2 switch entities (for manual furnace/ac control)
- - The thermostat entity allows you to control target temperature and thermostat mode through HA. Any changes will be reflected on the Core2.
- - Manual mode is not supported by the HA thermostat entity. State of the devices (heating/cooling/fan on-off will be accurately reflected in home assistant's thermostat entity, but the thermostat mode will be 'off'.You can use the HA switch entities to manually change the state of the devices from HA. When you do so, the thermostat will automatically switch to manual mode (or 'off' in the HA thermostat entity).
- - You can't yet  manually turn on/off a fan from HA.
+ - The thermostat entity allows you to control target temperature and thermostat mode through HA
+ - Manual mode is not supported by the HA thermostat entity. Device states are accurately reflected, but the thermostat mode will show as 'off' when in manual mode
+ - Switch entities can be used to manually control devices from HA
 
 ## Usage notes:
- - Upon start the thermostat will be OFF. Tapping the OFF label will run the thermostat through the various modes: OFF - AUTO - MAN - HEAT - COOL - FAN
- - When in manual mode, use the A/B/C buttons to turn on/off heat pump, AC, Fan. Only 1 device can be on at a given time.
- - When min cycle duration requirement isn't met, the Core2 display will blink until it is able to implement the change
- - Blinking is not supported on the Lovelace thermostat card. The HA dashboard will not change until the min cycle duration requirement is met.
- - Core2 can display temperature in Celsius or Fahrenheit (set DISP_TEMPERATURE accordingly). Default is Fahrenheit. Home Assistant will display temperature depending on your HA preferences (metric vs imperial) 
+ - Upon start the thermostat will be OFF. Tap the mode label to cycle through modes: OFF - AUTO - MAN - HEAT - COOL - FAN
+ - When in manual mode, use the touch interface to control heat, AC, and fan. Only 1 device can be on at a time
+ - When min cycle duration requirement isn't met, the display will blink until the change can be implemented
+ - Temperature can be displayed in Celsius or Fahrenheit (set DISP_TEMPERATURE accordingly). Default is Fahrenheit
+ - Home Assistant will display temperature according to your HA preferences (metric vs imperial)
 
+## Installation:
+1. Flash MicroPython to your T-Display S3
+2. Install required libraries using mpremote or your preferred method:
+   ```bash
+   mpremote connect /dev/ttyUSB0 mip install st7789
+   mpremote connect /dev/ttyUSB0 mip install micropython-umqtt.simple
+   ```
+3. Copy all files to the T-Display S3:
+   - Thermostat.py
+   - tft_config.py
+   - config.py (create with your settings)
+   - Graphics files in /res directory
+
+## Contributing:
+Contributions are welcome! Please feel free to submit a Pull Request.
