@@ -1,39 +1,4 @@
-# Smart thermostat, built for LILYGO T-Display S3.
-#
-# Key features:
-# - all thermostat logic is built into this Python script and runs on T-Display S3
-# - thermostat supports auto, manual, fan, heat, cool modes
-# - minimum cycle duration can be set (THERMO_MIN_CYCLE)
-# - swing mode is enabled and can be customized (THERMO_COLD_TOLERANCE and THERMO_HEAT_TOLERANCE)
-#
-# Configuration considerations:
-# - Relies on separate config.py file to store secrets (WiFI and MQTT connection details)
-# - Gets actual temperature through DHT22 sensor, connected to the T-Display S3.
-# - Uses MQTT to communicate with relays that turn on/off furnace, fan, and AC.
-# - Graphics files for heat/cool/fan need to be stored in the /res directory
-#
-# Home Assistant integration:
-# - Integrates with Home Assistant through MQTT (you need MQTT enabled on the HA side)
-# - Supports MQTT auto-discovery. No configuration needed on the HA side.
-# - Will create 'T-Display S3 Thermostat' device with following entities:
-#    - 1 sensor for temperature (if using the DHT22)
-#    - 1 thermostat entity
-#    - 2 switch entities for manually turning on/off heater/ac (fan is not implemented yet)
-# - The thermostat entity allows you to control target temperature and thermostat mode through HA. Any changes will be reflected on the T-Display S3.
-# - When you manually switch a device on/off through the HA interface, the thermostat entity will be switched to 'off'
-#   while the T-Display S3 will automatically switch to manual mode (HA doesn't support a 'manual mode' for the thermostat)
-# - The switch entities in HA are subscribed to the same MQTT topics you've configured to communicate with your appliances. However, when HA issues
-#   a switch change, the command will go only to the T-Display S3, who will process it, switch the termostat to manual mode, and then executes a state change.
-#
-# Usage notes:
-# - Upon start the thermostat will be OFF. Tapping the OFF label will run the thermostat through the various modes: OFF - AUTO - MAN - HEAT - COOL - FAN
-# - When in manual mode, use the A/B/C buttons to turn on/off heat pump, AC, Fan. Only 1 device can be on at a given time.
-# - When min cycle duration requirement isn't met, the T-Display S3 display will blink until it is able to implement the change
-# - Blinking is not supported on the Lovelace thermostat card. The HA dashboard will not change until the min cycle duration requirement is met.
-# - T-Display S3 can display temperature in Celsius or Fahrenheit (set DISP_TEMPERATURE accordingly). Default is Fahrenheit.
-#   Home Assistant will display temperature depending on your HA preferences (metric vs imperial) 
-
-from machine import Pin, SPI
+from machine import Pin, SPI, Timer
 import tft_config
 import vga1_bold_16x32 as font
 import dht
@@ -43,6 +8,7 @@ import math
 from numbers import Number
 import json
 import config
+import time
 
 # Device information
 ATTR_MANUFACTURER = "LILYGO"
@@ -51,6 +17,11 @@ ATTR_NAME = "T-Display S3 Thermostat"
 
 # Pin definitions
 DHT_PIN = 15  # Adjust this to match your DHT22 connection
+BUTTON_1_PIN = 0   # Left button
+BUTTON_2_PIN = 14  # Right button
+
+# Button debounce time (ms)
+DEBOUNCE_MS = 200
 
 # Default topics used to communicate with Home Assistant
 DEFAULT_DISC_PREFIX = "homeassistant/"
@@ -165,84 +136,39 @@ tft = tft_config.tft
 tft.init(tft_config.MHS35, width=240, height=240, speed=40000000, rst_pin=33, backl_pin=32, miso=19, mosi=23, clk=18, cs=14, dc=27, bgr=True, backl_on=1, invrot=3)
 tft.set_brightness(10)
 
-# Using lvgl library to implement an invisible touch area (behind the mode label) to switch thermostat mode
-lv.init()
-scr = lv.obj() 
-scr.set_style_local_bg_color(scr.PART.MAIN, lv.STATE.DEFAULT, lv.color_hex(0x000000))
+# Initialize buttons
+button1 = Pin(BUTTON_1_PIN, Pin.IN, Pin.PULL_UP)
+button2 = Pin(BUTTON_2_PIN, Pin.IN, Pin.PULL_UP)
+last_button1_time = 0
+last_button2_time = 0
 
-path_ease_out = lv.anim_path_t()
-path_ease_out.init()
+def button1_handler(pin):
+    global last_button1_time, thermo_state
+    current_time = time.ticks_ms()
+    if time.ticks_diff(current_time, last_button1_time) > DEBOUNCE_MS:
+        # Cycle through modes
+        current_mode = THERMO_MODES.index(thermo_state)
+        next_mode = (current_mode + 1) % len(THERMO_MODES)
+        thermo_state = THERMO_MODES[next_mode]
+        update_display()
+        last_button1_time = current_time
 
-# create button
-btn = lv.btn(scr) 
-btn.set_size(40, 20)
-btn.align(None, lv.ALIGN.CENTER, 0, 55)
-# set button style to make it invisible and implement a cool touch feedback effect
-btn.set_style_local_bg_color(scr.PART.MAIN,lv.STATE.DEFAULT, lv.color_hex(0x0000ff))
-styleButton = lv.style_t() # create style
-styleButton.set_bg_color(lv.STATE.DEFAULT, lv.color_hex(0x0000ff))
-styleButton.set_transition_time(lv.STATE.PRESSED, 300)
-styleButton.set_transition_time(lv.STATE.DEFAULT, 0)
-styleButton.set_transition_delay(lv.STATE.DEFAULT, 300)
-styleButton.set_bg_opa(lv.STATE.DEFAULT, 0)
-styleButton.set_bg_opa(lv.STATE.PRESSED, lv.OPA._80)
-styleButton.set_border_width(lv.STATE.DEFAULT, 0)
-styleButton.set_outline_width(lv.STATE.DEFAULT, 0)
-styleButton.set_transform_width(lv.STATE.DEFAULT, -20)
-styleButton.set_transform_height(lv.STATE.DEFAULT, -20)
-styleButton.set_transform_width(lv.STATE.PRESSED, 0)
-styleButton.set_transform_height(lv.STATE.PRESSED, 0)
-styleButton.set_transition_path(lv.STATE.DEFAULT, path_ease_out)
-styleButton.set_transition_prop_1(lv.STATE.DEFAULT, lv.STYLE.BG_OPA)
-styleButton.set_transition_prop_2(lv.STATE.DEFAULT, lv.STYLE.TRANSFORM_WIDTH)
-styleButton.set_transition_prop_3(lv.STATE.DEFAULT, lv.STYLE.TRANSFORM_HEIGHT)
-btn.add_style(btn.PART.MAIN,styleButton) #define this style
+def button2_handler(pin):
+    global last_button2_time, target_temp
+    current_time = time.ticks_ms()
+    if time.ticks_diff(current_time, last_button2_time) > DEBOUNCE_MS:
+        # Adjust temperature (press to increase, long press to decrease)
+        if pin.value() == 0:  # Button pressed
+            if current_time - last_button2_time > 1000:  # Long press
+                target_temp = max(THERMO_MIN_TARGET, target_temp - 0.5)
+            else:
+                target_temp = min(THERMO_MAX_TARGET, target_temp + 0.5)
+            update_display()
+        last_button2_time = current_time
 
-# button press callback action (ie. change thermostat mode)
-def change_mode(btn, event):
-    global src, thermo_state
-    if(event == lv.EVENT.CLICKED):
-        btn.set_style_local_bg_color(btn.PART.MAIN, lv.STATE.DEFAULT, lv.color_hex(0xffccf9))
-        thermo_state = THERMO_MODES[(THERMO_MODES.index(thermo_state) + 1) % 6]
-        m5mqtt.publish(DEFAULT_TOPIC_THERMOSTAT_PREFIX + TOPIC_MODE_STATE, str(thermo_state)) 
-        thermostat_decision_logic()
-    
-# define callback  
-btn.set_event_cb(change_mode)
-
-# load the screen
-lv.scr_load(scr)
-
-dht22 = dht.DHT22(Pin(DHT_PIN))
-
-img_BtnA = lv.img(scr)
-img_BtnA.set_src("res/heat.png")
-img_BtnA.align(None, lv.ALIGN.CENTER, 0, 55)
-
-img_BtnB = lv.img(scr)
-img_BtnB.set_src("res/cool.png")
-img_BtnB.align(None, lv.ALIGN.CENTER, 0, 55)
-
-img_BtnC = lv.img(scr)
-img_BtnC.set_src("res/fan.png")
-img_BtnC.align(None, lv.ALIGN.CENTER, 0, 55)
-
-slider_target = lv.slider(scr)
-slider_target.set_range(THERMO_MIN_TARGET, THERMO_MAX_TARGET)
-slider_target.set_value(20)
-slider_target.align(None, lv.ALIGN.CENTER, 0, 55)
-
-lbl_target = lv.label(scr)
-lbl_target.set_text("")
-lbl_target.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-
-lbl_action = lv.label(scr)
-lbl_action.set_text("")
-lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_ACTION_OFFSET)
-
-lbl_mode = lv.label(scr)
-lbl_mode.set_text("")
-lbl_mode.set_align(ALIGN_CENTER, 0, DISP_LBL_MODE_OFFSET)
+# Set up button interrupts
+button1.irq(trigger=Pin.IRQ_FALLING, handler=button1_handler)
+button2.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=button2_handler)
 
 # Setup initial comms and register with Home Assistant (through auto-discovery)
 def comms_init():
@@ -397,9 +323,8 @@ def thermostat_init():
     change_ignored = 0
     cycle = 0
     delay = 0      # initial delay of 10s so that user can select the right mode without appliances suddenly turning on
-    slider_target.set_value(20)
     thermo_state = THERMO_MODES[0]
-    target_temp = slider_target.get_value()
+    target_temp = 20  # Default target temperature
     ticks = 0
     
     # initial state of thermostat is OFF and all appliances are OFF
@@ -411,137 +336,28 @@ def thermostat_init():
 # update display everytime there is a change (due to incoming HA info, screen interaction, or sensor data changes)
 def update_display():
     tft.clear()
-    lbl_mode.set_text(thermo_state)
-    lbl_mode.set_align(ALIGN_CENTER, 0, DISP_LBL_MODE_OFFSET)
+    tft.font(font)
+    tft.print(thermo_state, DISP_XCOORD, DISP_YCOORD, 0xffffff)
     target_temp_display = round(target_temp if DISP_TEMPERATURE == "C" else target_temp * 9 / 5 + 32)
     actual_temp_display = actual_temp if DISP_TEMPERATURE == "C" else actual_temp * 9 / 5 + 32
     
     # If mode is manual
     if thermo_state == THERMO_MODES[2]:    
-        img_BtnA.set_hidden(False)
-        img_BtnB.set_hidden(False)
-        img_BtnC.set_hidden(False)
-        slider_target.set_hidden(True)
-        lbl_target.set_text("")
-        lbl_target.set_text_color(0xffffff)
-        lbl_target.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
         if heating_state ==1:
-            lbl_action.set_text('HEATING')
-            lbl_action.set_text_color(DISP_COLOR_HEAT)
-            lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-            lbl_action.set_text_color(DISP_COLOR_HEAT)
-            if change_ignored == 1:
-                timerSch.run("blink_now", 305, 0x00)
-            else:
-                timerSch.stop("blink_now")
-                lbl_target.set_text_color(DISP_COLOR_HEAT)
+            tft.print('HEATING', DISP_XCOORD, DISP_YCOORD + 20, DISP_COLOR_HEAT)
         elif cooling_state ==1:
-            lbl_action.set_text('COOLING')
-            lbl_action.set_text_color(DISP_COLOR_COOL)
-            lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-            lbl_target.set_text_color(DISP_COLOR_COOL)
-            if change_ignored == 1:
-                timerSch.run("blink_now", 305, 0x00)
-            else:
-                timerSch.stop("blink_now")
-                lbl_target.set_text_color(DISP_COLOR_COOL)    
+            tft.print('COOLING', DISP_XCOORD, DISP_YCOORD + 20, DISP_COLOR_COOL)
         elif fan_state ==1:
-            lbl_action.set_text('FAN')
-            lbl_action.set_text_color(0xffffff)
-            lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-            lbl_target.set_text_color(0xffffff)
-            if change_ignored == 1:
-                timerSch.run("blink_now", 305, 0x00)
-            else:
-                timerSch.stop("blink_now")
-                lbl_target.set_text_color(0xffffff)
+            tft.print('FAN', DISP_XCOORD, DISP_YCOORD + 20, 0xffffff)
         else:
-            lbl_action.set_text('IDLE')
-            lbl_action.set_text_color(0xffffff)
-            lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-            if change_ignored == 1:
-                timerSch.run("blink_now", 305, 0x00)
-            else:
-                timerSch.stop("blink_now")
-                lbl_target.set_text_color(0xffffff)            
+            tft.print('IDLE', DISP_XCOORD, DISP_YCOORD + 20, 0xffffff)
     else:
-        img_BtnA.set_hidden(True)
-        img_BtnB.set_hidden(True)
-        img_BtnC.set_hidden(True)
+        tft.print(str(target_temp_display), DISP_XCOORD, DISP_YCOORD + 20, 0xffffff)
         
-    # If mode is off
-    if thermo_state == THERMO_MODES[0] and change_ignored == 0:
-        tft.font(font)
-        lbl_action.set_text('')
-        lbl_target.set_text("---")
-        lbl_target.set_text_color(0xffffff)
-        lbl_target.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-        
-    # If cooling is on
-    elif cooling_state == 1 and thermo_state != THERMO_MODES[2]:
-        lbl_action.set_text('COOLING')
-        lbl_action.set_text_color(DISP_COLOR_COOL)
-        lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_ACTION_OFFSET)
-        lbl_target.set_text(str(target_temp_display))
-        lbl_target.set_text_color(DISP_COLOR_COOL)
-        lbl_target.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-        slider_target.set_hidden(False)
-        if change_ignored == 1:
-            timerSch.run("blink_now", 305, 0x00)
-        else:
-            timerSch.stop("blink_now")
-            lbl_target.set_text_color(DISP_COLOR_COOL)
-        
-    # if heating is on
-    elif heating_state == 1 and thermo_state != THERMO_MODES[2]:
-        lbl_action.set_text('HEATING')
-        lbl_action.set_text_color(DISP_COLOR_HEAT)
-        lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_ACTION_OFFSET)
-        lbl_target.set_text(str(target_temp_display))
-        lbl_target.set_text_color(DISP_COLOR_HEAT)
-        lbl_target.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-        slider_target.set_hidden(False)
-        if change_ignored == 1:
-            timerSch.run("blink_now", 305, 0x00)
-        else:
-            timerSch.stop("blink_now")
-            lbl_target.set_text_color(DISP_COLOR_HEAT)
-
-    # if fan is on
-    elif fan_state == 1 and thermo_state != THERMO_MODES[2]:
-        lbl_action.set_text('FAN')
-        lbl_action.set_text_color(0xffffff)
-        lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_ACTION_OFFSET)
-        lbl_target.set_text(str(target_temp_display))
-        lbl_target.set_text_color(0xffffff)
-        lbl_target.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-        slider_target.set_hidden(False)
-        if change_ignored == 1:
-            timerSch.run("blink_now", 305, 0x00)
-        else:
-            timerSch.stop("blink_now")
-            lbl_target.set_text_color(0xffffff)
-            
-   # if none of the above conditions are true (ie. thermostat is on, but idle)   
-    elif thermo_state != THERMO_MODES[2]:
-        lbl_action.set_text('IDLE')
-        lbl_action.set_text_color(0xffffff)
-        lbl_action.set_align(ALIGN_CENTER, 0, DISP_LBL_ACTION_OFFSET)
-        lbl_target.set_text(str(target_temp_display))
-        lbl_target.set_text_color(0xffffff)
-        lbl_target.set_align(ALIGN_CENTER, 0, DISP_LBL_TARGET_OFFSET)
-        slider_target.set_hidden(False)
-        if change_ignored == 1:
-            timerSch.run("blink_now", 305, 0x00)
-        else:
-            timerSch.stop("blink_now")
-            lbl_target.set_text_color(0xffffff)
-            
-# Draw the temperature arc
+    # Draw the temperature arc
     t = THERMO_MIN_TEMP
     while t <= THERMO_MAX_TEMP:
         angle = (t * 8 + 200) % 360
-        tft.font(font)
         if t > min(round(actual_temp),target_temp) and t < max(round(actual_temp), target_temp) and thermo_state in [THERMO_MODES[index] for index in [1,3,4]]:
             tft.line(
                 int(DISP_R1 * math.sin(angle / 180 * math.pi) + DISP_XCOORD),
@@ -585,7 +401,7 @@ def update_display():
 def thermostat_decision_logic():
     global actual_temp, target_temp, manual_command
     actual_temp = dht22.temperature()
-    target_temp = slider_target.get_value()
+    target_temp = 20  # Default target temperature
     
     if thermo_state == THERMO_MODES[2]: 
         if manual_command == "heating on" and heating_state == 0:
@@ -601,7 +417,6 @@ def thermostat_decision_logic():
         elif manual_command == "fan off" and fan_state == 1:
             change_to("fan off")
         else:
-            timerSch.stop("blink_now")
             update_display()
         return
     
@@ -644,7 +459,6 @@ def thermostat_decision_logic():
         change_to ("fan off")
     else:
         # no action
-        timerSch.stop("blink_now")
         update_display()
 
 # Here's where the appliances are turned on/off using MQTT messages.
@@ -697,8 +511,6 @@ def change_to (action):
             m5mqtt.publish(DEFAULT_TOPIC_THERMOSTAT_PREFIX + TOPIC_ACTION, "idle") 
             fan_state = 0           
         delay = THERMO_MIN_CYCLE
-        timerSch.run("delayed_start", 1000, 0x00)
-        timerSch.stop("blink_now")
         update_display()
     else:
         change_ignored = 1
@@ -719,46 +531,9 @@ def update_mqtt_state_topics():
     #update state of thermostat mode
     m5mqtt.publish(DEFAULT_TOPIC_THERMOSTAT_PREFIX + TOPIC_MODE_STATE, str(thermo_state))    
         
-@timerSch.event("delayed_start")
-def tdelayed_start():
-    global delay
-    delay -= 1
-    if delay == 0:
-        timerSch.stop("delayed_start")
-        thermostat_decision_logic()
-
-@timerSch.event("main_loop")
-def tmain_loop():
-    global ticks
-    ticks += 1
-            
-@timerSch.event("blink_now")
-def tblink_now():
-    global blink
-    if heating_state == 1:
-        color = DISP_COLOR_HEAT
-    elif cooling_state == 1:
-        color = DISP_COLOR_COOL
-    else:
-        color = 0xffffff
-    if blink == 0:
-        lbl_target.set_text_color(0x000000)
-        lbl_action.set_text_color(0x000000)
-        blink = 1
-    else:
-        lbl_target.set_text_color(color)
-        lbl_action.set_text_color(color)
-        blink = 0        
-
-def slider_target_changed(target_temp):
-    m5mqtt.publish(DEFAULT_TOPIC_THERMOSTAT_PREFIX + TOPIC_STATE, str(target_temp))
-    thermostat_decision_logic()
-
-slider_target.changed(slider_target_changed)
-
 def rcv_target_temp (topic_data):
     global target_temp
-    slider_target.set_value(round(float(topic_data)))
+    target_temp = round(float(topic_data))
     thermostat_decision_logic()
 
 def rcv_thermo_state (topic_data):
@@ -795,34 +570,10 @@ def rcv_discovery (topic_data):
 thermostat_init()
 comms_init()
 thermostat_decision_logic()
-timerSch.run("main_loop", 999, 0x00)
+
+dht22 = dht.DHT22(Pin(DHT_PIN))
 
 while True:
-    
-# We ignore button presses unless the Thermostat is in manual mode
-    if btnA.wasPressed() and thermo_state == THERMO_MODES[2]:
-        if heating_state == 0:
-            manual_command = "heating on"
-        elif heating_state == 1:
-            manual_command = "heating off"
-        thermostat_decision_logic()
-        
-    if btnB.wasPressed() and thermo_state == THERMO_MODES[2]:
-        if cooling_state == 0:
-            manual_command = "cooling on"
-        elif cooling_state == 1:
-            manual_command = "cooling off"
-        thermostat_decision_logic()
-        
-    if btnC.wasPressed() and thermo_state == THERMO_MODES[2]:
-        if fan_state == 0:
-            manual_command = "fan on"
-        elif fan_state == 1:
-            manual_command = "fan off"
-        thermostat_decision_logic()
-            
-    if ticks == THERMO_UPDATE_FREQUENCY:
-        thermostat_decision_logic()
-        update_mqtt_state_topics()
-        ticks = 0
-    wait_ms(2)
+    thermostat_decision_logic()
+    update_mqtt_state_topics()
+    wait_ms(2000)
