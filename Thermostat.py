@@ -1,4 +1,4 @@
-from machine import Pin, SPI, Timer
+from machine import Pin, SPI, Timer, reset
 import tft_config
 import vga1_bold_16x32 as font
 import dht
@@ -130,6 +130,16 @@ THERMO_COLD_TOLERANCE = 0.5      # C
 THERMO_HEAT_TOLERANCE = 0.5      # C
 THERMO_UPDATE_FREQUENCY = 20   # seconds
 THERMO_MODES = ["off", "auto", "man", "heat", "cool", "fan"]
+
+# Constants for connection retry
+WIFI_RETRY_DELAY = 5000  # ms
+MQTT_RETRY_DELAY = 5000  # ms
+MAX_FAILURES = 3  # Reset device after this many consecutive failures
+
+# Global connection state
+wifi_failures = 0
+mqtt_failures = 0
+last_successful_reading = None
 
 # Initialize display
 tft = tft_config.tft
@@ -518,12 +528,19 @@ def change_to (action):
 
 
 def update_mqtt_state_topics():
+    if not check_wifi() or not check_mqtt():
+        return
+        
     #update state of DHT22 sensors
+    temp, humidity = read_dht()
     payload = {
-        "temperature": dht22.temperature(),
-        "humidity": dht22.humidity()
-        }
-    m5mqtt.publish(DEFAULT_TOPIC_SENSOR_PREFIX + TOPIC_STATE,str(json.dumps(payload)))
+        "temperature": temp,
+        "humidity": humidity
+    }
+    try:
+        m5mqtt.publish(DEFAULT_TOPIC_SENSOR_PREFIX + TOPIC_STATE, str(json.dumps(payload)))
+    except Exception as e:
+        print("MQTT publish error:", e)
     
     #update state of thermostat target temperature
     m5mqtt.publish(DEFAULT_TOPIC_THERMOSTAT_PREFIX + TOPIC_STATE, str(target_temp))
@@ -567,6 +584,68 @@ def rcv_discovery (topic_data):
     m5mqtt.publish(DEFAULT_TOPIC_SWITCH_PREFIX + TOPIC_AC_STATUS, "on")
     thermostat_decision_logic()
     
+def check_wifi():
+    global wifi_failures
+    if not wlan.isconnected():
+        print("WiFi disconnected. Attempting to reconnect...")
+        try:
+            wlan.connect(config.WIFI_SSID, config.WIFI_PASS)
+            time.sleep_ms(WIFI_RETRY_DELAY)
+            if wlan.isconnected():
+                print("WiFi reconnected")
+                wifi_failures = 0
+                return True
+            wifi_failures += 1
+            if wifi_failures >= MAX_FAILURES:
+                print("Too many WiFi failures. Resetting device...")
+                reset()
+            return False
+        except Exception as e:
+            print("WiFi connection error:", e)
+            return False
+    return True
+
+def check_mqtt():
+    global mqtt_failures
+    try:
+        m5mqtt.ping()
+        mqtt_failures = 0
+        return True
+    except:
+        print("MQTT disconnected. Attempting to reconnect...")
+        try:
+            m5mqtt.connect()
+            time.sleep_ms(MQTT_RETRY_DELAY)
+            mqtt_failures = 0
+            return True
+        except Exception as e:
+            print("MQTT connection error:", e)
+            mqtt_failures += 1
+            if mqtt_failures >= MAX_FAILURES:
+                print("Too many MQTT failures. Resetting device...")
+                reset()
+            return False
+
+def read_dht():
+    global last_successful_reading
+    try:
+        dht22.measure()
+        temp = dht22.temperature()
+        hum = dht22.humidity()
+        last_successful_reading = (temp, hum)
+        return temp, hum
+    except OSError as e:
+        print("DHT22 read error:", e)
+        if last_successful_reading:
+            print("Using last successful reading")
+            return last_successful_reading
+        return (20, 50)  # Default fallback values
+    except Exception as e:
+        print("Unexpected DHT22 error:", e)
+        if last_successful_reading:
+            return last_successful_reading
+        return (20, 50)  # Default fallback values
+
 thermostat_init()
 comms_init()
 thermostat_decision_logic()
@@ -574,6 +653,7 @@ thermostat_decision_logic()
 dht22 = dht.DHT22(Pin(DHT_PIN))
 
 while True:
-    thermostat_decision_logic()
-    update_mqtt_state_topics()
-    wait_ms(2000)
+    if check_wifi() and check_mqtt():
+        thermostat_decision_logic()
+        update_mqtt_state_topics()
+    time.sleep_ms(2000)
